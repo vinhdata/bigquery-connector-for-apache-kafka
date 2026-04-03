@@ -1,0 +1,143 @@
+name: Manual release · notest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to checkout and build (default: main)"
+        required: false
+        default: "main"
+      notest_id:
+        description: "Numeric suffix for tag/assets (digits only). Empty = workflow run number."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manual-release-notest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and release (notest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: echo "$GITHUB_CONTEXT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'adopt'
+          java-version: 17
+          cache: maven
+
+      - name: Read version from pom.xml
+        run: |
+          set -euo pipefail
+          raw=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "Raw POM version: $raw"
+          version="${raw%-SNAPSHOT}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Cannot parse a valid semver from pom.xml (got: $raw)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_ENV"
+
+          NI="${{ github.event.inputs.notest_id }}"
+          NI="${NI//[[:space:]]/}"
+          [ -z "$NI" ] && NI="${{ github.run_number }}"
+          if [[ ! "$NI" =~ ^[0-9]+$ ]]; then
+            echo "notest_id must be digits only (got: $NI)"
+            exit 1
+          fi
+          echo "notest_id=$NI" >> "$GITHUB_ENV"
+          echo "release_commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "git_tag=v${version}-notest-${NI}" >> "$GITHUB_ENV"
+          echo "release_title=v${version}-notest-${NI}" >> "$GITHUB_ENV"
+          echo "--- Summary ---"
+          echo "version=$version  notest_id=$NI  tag=v${version}-notest-${NI}"
+
+      - name: Build (skip tests — no unit or integration tests)
+        run: |
+          set -euo pipefail
+          mvn -ntp install -DskipTests
+          mvn -f kcbq-connector clean package assembly:single@release-artifacts -DskipTests
+
+          T=kcbq-connector/target
+          mapfile -t tars < <(find "$T" -maxdepth 1 -type f -name 'bigquery-connector-for-apache-kafka-*.tar' | sort)
+          mapfile -t zips < <(find "$T" -maxdepth 1 -type f -name 'bigquery-connector-for-apache-kafka-*.zip' | sort)
+          if [ "${#tars[@]}" -ne 1 ] || [ "${#zips[@]}" -ne 1 ]; then
+            echo "Expected 1 .tar + 1 .zip, got tar=${#tars[@]} zip=${#zips[@]}"
+            ls -la "$T"/*.{tar,zip} 2>/dev/null || true
+            exit 1
+          fi
+
+          # Strip -SNAPSHOT from filenames and append -notest-<id>
+          tar_src="${tars[0]}"
+          zip_src="${zips[0]}"
+          tar_base=$(basename "$tar_src" .tar)
+          zip_base=$(basename "$zip_src" .zip)
+          tar_base="${tar_base/-SNAPSHOT/}"
+          zip_base="${zip_base/-SNAPSHOT/}"
+          tar_new="${tar_base}-notest-${notest_id}.tar"
+          zip_new="${zip_base}-notest-${notest_id}.zip"
+          mv "$tar_src" "$T/$tar_new"
+          mv "$zip_src" "$T/$zip_new"
+          echo "tar_file=$tar_new" >> "$GITHUB_ENV"
+          echo "zip_file=$zip_new" >> "$GITHUB_ENV"
+          echo "tar_path=$(realpath "$T/$tar_new")" >> "$GITHUB_ENV"
+          echo "zip_path=$(realpath "$T/$zip_new")" >> "$GITHUB_ENV"
+          echo "Artifacts: $tar_new  $zip_new"
+
+      - name: Create tag
+        run: |
+          git config --local user.name "GitHub Action"
+          git config --local user.email "action@github.com"
+          git tag -a "${{ env.git_tag }}" -m "Release ${{ env.git_tag }} (notest, tests skipped)"
+          git push origin "${{ env.git_tag }}"
+
+      - name: Create release (public)
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.git_tag }}
+          release_name: ${{ env.release_title }}
+          commitish: ${{ env.release_commit_sha }}
+          body: |
+            **Notest build** — unit and integration tests were **not** run (`mvn -DskipTests`).
+
+            POM base version: `${{ env.version }}` · Tag: `${{ env.git_tag }}` · Ref: `${{ github.event.inputs.ref }}`
+          draft: false
+          prerelease: false
+
+      - name: Upload tar
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.tar_path }}
+          asset_name: ${{ env.tar_file }}
+          asset_content_type: application/x-tar
+
+      - name: Upload zip
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.zip_path }}
+          asset_name: ${{ env.zip_file }}
+          asset_content_type: application/zip
